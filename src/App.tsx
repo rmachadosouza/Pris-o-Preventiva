@@ -1,99 +1,92 @@
-import React, { useState, useMemo } from 'react';
-import { Navbar } from './components/Navbar';
-import { StatutoryChecklist } from './components/StatutoryChecklist';
-import { CustodyHearingFlow } from './components/CustodyHearingFlow';
-import { DeadlineCalculator } from './components/DeadlineCalculator';
-import { AlternativeMeasures } from './components/AlternativeMeasures';
-import { DomiciliaryArrest } from './components/DomiciliaryArrest';
-import { DocumentGenerator } from './components/DocumentGenerator';
-import { JurisprudenceReference } from './components/JurisprudenceReference';
-import { CaseEvaluation } from './types';
-import { CASE_PRESETS } from './data/presets';
-import { evaluateCase } from './utils/evaluator';
-import { Scale, ExternalLink } from 'lucide-react';
+/**
+ * @license
+ * SPDX-License-Identifier: Apache-2.0
+ */
 
-export function App() {
-  const [activeTab, setActiveTab] = useState<string>('checklist');
-  const [currentCase, setCase] = useState<CaseEvaluation>(CASE_PRESETS[0].data);
+import React, { useState } from 'react';
+import { CaseForm } from './components/CaseForm';
+import { DecisionDisplay } from './components/DecisionDisplay';
+import { CaseData } from './types';
+import { generateAnalysis } from './services/ai';
+import { Scale, Info } from 'lucide-react';
 
-  // Memoized evaluation
-  const result = useMemo(() => evaluateCase(currentCase), [currentCase]);
+export default function App() {
+  const [decision, setDecision] = useState<string>('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleSubmit = async (data: CaseData) => {
+    setIsLoading(true);
+    setError(null);
+    setDecision('');
+
+    try {
+      const result = await generateAnalysis(data);
+      setDecision(result);
+    } catch (err: any) {
+      setError(err?.message || 'Ocorreu um erro ao gerar a análise. Por favor, tente novamente.');
+      console.error(err);
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col selection:bg-amber-500/25 selection:text-amber-200">
-      
-      {/* Top Navbar */}
-      <Navbar 
-        activeTab={activeTab} 
-        setActiveTab={setActiveTab} 
-        isLegal={result.isLegal} 
-      />
-
-      {/* Main Content Area */}
-      <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 lg:px-8 py-8">
-        {activeTab === 'checklist' && (
-          <StatutoryChecklist 
-            currentCase={currentCase} 
-            setCase={setCase} 
-            result={result} 
-          />
-        )}
-
-        {activeTab === 'custody' && (
-          <CustodyHearingFlow 
-            currentCase={currentCase} 
-          />
-        )}
-
-        {activeTab === 'deadlines' && (
-          <DeadlineCalculator 
-            currentCase={currentCase} 
-          />
-        )}
-
-        {activeTab === 'cautelares' && (
-          <AlternativeMeasures 
-            currentCase={currentCase} 
-          />
-        )}
-
-        {activeTab === 'domiciliary' && (
-          <DomiciliaryArrest 
-            currentCase={currentCase} 
-            setCase={setCase} 
-          />
-        )}
-
-        {activeTab === 'documents' && (
-          <DocumentGenerator 
-            currentCase={currentCase} 
-            result={result} 
-          />
-        )}
-
-        {activeTab === 'jurisprudence' && (
-          <JurisprudenceReference />
-        )}
-      </main>
-
-      {/* Footer */}
-      <footer className="border-t border-slate-900 bg-slate-950/80 py-8 text-xs text-slate-500 text-center">
-        <div className="max-w-7xl mx-auto px-4 space-y-2">
-          <div className="flex items-center justify-center gap-2 text-slate-400 font-serif-legal font-bold">
-            <Scale className="w-4 h-4 text-amber-500" />
-            <span>SISTEMA DE DECISÃO E ANÁLISE DE PRISÃO PREVENTIVA (CPP)</span>
+    <div className="min-h-screen bg-slate-50 pb-12">
+      {/* Header */}
+      <header className="bg-white border-b border-slate-200 sticky top-0 z-10 shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 h-16 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="bg-indigo-600 p-2 rounded-lg text-white">
+              <Scale className="w-6 h-6" />
+            </div>
+            <div>
+              <h1 className="text-xl font-bold text-slate-900 tracking-tight">Magistrado Digital</h1>
+              <p className="text-xs text-slate-500 font-medium">Análise Preventiva • Lei 15.272/2025</p>
+            </div>
           </div>
-          <p>
-            Em conformidade com a Lei nº 13.964/2019 (Pacote Anticrime), Lei nº 13.769/2018 (Prisão Domiciliar Materna), Resolução nº 213/2015 do CNJ e Jurisprudência do STF e STJ.
-          </p>
-          <p className="text-[11px] text-slate-600 font-mono">
-            Código de Processo Penal Brasileiro • Arts. 282, 310, 311, 312, 313, 315, 316, 318, 318-A e 319
-          </p>
+          <div className="hidden md:flex items-center gap-2 text-sm text-slate-500 bg-slate-100 px-3 py-1.5 rounded-full">
+            <Info className="w-4 h-4" />
+            <span>Ambiente Seguro • Ultima Ratio</span>
+          </div>
         </div>
-      </footer>
+      </header>
 
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+          {/* Input Section */}
+          <div className="lg:col-span-5 xl:col-span-4 space-y-6">
+            <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-4 text-sm text-indigo-900">
+              <p className="font-semibold mb-1">Instruções:</p>
+              <p>Faça o upload do PDF contendo os autos do processo (flagrante, representação, etc.). A IA lerá o documento, extrairá os dados relevantes e gerará a decisão judicial fundamentada.</p>
+            </div>
+            
+            <CaseForm onSubmit={handleSubmit} isLoading={isLoading} />
+          </div>
+
+          {/* Output Section */}
+          <div className="lg:col-span-7 xl:col-span-8">
+            {error && (
+              <div className="bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded-lg mb-6 flex items-center gap-2">
+                <Info className="w-5 h-5" />
+                {error}
+              </div>
+            )}
+            
+            {decision ? (
+              <DecisionDisplay decision={decision} />
+            ) : (
+              <div className="h-full min-h-[400px] flex flex-col items-center justify-center text-slate-400 border-2 border-dashed border-slate-200 rounded-xl bg-slate-50/50 p-8 text-center">
+                <Scale className="w-16 h-16 mb-4 opacity-20" />
+                <h3 className="text-lg font-medium text-slate-600 mb-2">Aguardando Análise</h3>
+                <p className="max-w-md mx-auto">
+                  Preencha o formulário ao lado e clique em "Gerar Decisão Judicial" para visualizar a minuta da decisão.
+                </p>
+              </div>
+            )}
+          </div>
+        </div>
+      </main>
     </div>
   );
 }
-
-export default App;
