@@ -34,13 +34,14 @@ export function CaseForm({ onSubmit, isLoading }: CaseFormProps) {
     setError(null);
     if (!selectedFile) return;
 
-    if (selectedFile.type !== 'application/pdf') {
+    const isPdf = selectedFile.type === 'application/pdf' || selectedFile.name.toLowerCase().endsWith('.pdf');
+    if (!isPdf) {
       setError('Por favor, envie apenas arquivos PDF.');
       return;
     }
 
-    if (selectedFile.size > 10 * 1024 * 1024) { // 10MB limit
-      setError('O arquivo deve ter no máximo 10MB.');
+    if (selectedFile.size > 20 * 1024 * 1024) { // 20MB limit
+      setError('O arquivo deve ter no máximo 20MB.');
       return;
     }
 
@@ -60,10 +61,11 @@ export function CaseForm({ onSubmit, isLoading }: CaseFormProps) {
 
     const reader = new FileReader();
     reader.onload = () => {
-      const base64String = (reader.result as string).split(',')[1];
+      const resultStr = reader.result as string;
+      const base64String = resultStr.includes(',') ? resultStr.split(',')[1] : resultStr;
       onSubmit({
         fileData: base64String,
-        mimeType: file.type,
+        mimeType: file.type || 'application/pdf',
         fileName: file.name,
         additionalInfo
       });
