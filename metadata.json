@@ -1,0 +1,8 @@
+{
+  "name": "Prisão Preventiva - Analisador e Decisor CPP",
+  "description": "Plataforma jurídica interativa para verificação de requisitos legais (Arts. 311-316 do CPP), audiência de custódia, medidas cautelares alternativas e minutas processuais.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
