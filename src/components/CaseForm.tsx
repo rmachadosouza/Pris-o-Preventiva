@@ -16,6 +16,8 @@ export function CaseForm({ onSubmit, isLoading }: CaseFormProps) {
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     validateAndSetFile(selectedFile);
+    // Permite selecionar o mesmo arquivo de novo (senão o onChange não dispara).
+    e.target.value = '';
   };
 
   const handleDragOver = (e: React.DragEvent) => {
@@ -57,7 +59,7 @@ export function CaseForm({ onSubmit, isLoading }: CaseFormProps) {
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!file) return;
+    if (!file || isLoading) return;
 
     const reader = new FileReader();
     reader.onload = () => {
@@ -65,7 +67,7 @@ export function CaseForm({ onSubmit, isLoading }: CaseFormProps) {
       const base64String = resultStr.includes(',') ? resultStr.split(',')[1] : resultStr;
       onSubmit({
         fileData: base64String,
-        mimeType: file.type || 'application/pdf',
+        mimeType: 'application/pdf',
         fileName: file.name,
         additionalInfo
       });
@@ -89,6 +91,13 @@ export function CaseForm({ onSubmit, isLoading }: CaseFormProps) {
       </div>
 
       <form onSubmit={handleSubmit} className="space-y-6">
+        <input
+          type="file"
+          ref={fileInputRef}
+          onChange={handleFileChange}
+          accept="application/pdf,.pdf"
+          className="hidden"
+        />
         {!file ? (
           <div
             onClick={() => fileInputRef.current?.click()}
@@ -96,13 +105,6 @@ export function CaseForm({ onSubmit, isLoading }: CaseFormProps) {
             onDrop={handleDrop}
             className="border-2 border-dashed border-slate-300 rounded-xl p-10 text-center cursor-pointer hover:border-indigo-500 hover:bg-indigo-50 transition-all group"
           >
-            <input
-              type="file"
-              ref={fileInputRef}
-              onChange={handleFileChange}
-              accept="application/pdf"
-              className="hidden"
-            />
             <div className="bg-indigo-100 w-16 h-16 rounded-full flex items-center justify-center mx-auto mb-4 group-hover:scale-110 transition-transform">
               <Upload className="w-8 h-8 text-indigo-600" />
             </div>
@@ -110,7 +112,7 @@ export function CaseForm({ onSubmit, isLoading }: CaseFormProps) {
               Clique para selecionar ou arraste o arquivo
             </h3>
             <p className="text-sm text-slate-500">
-              Suporta apenas arquivos PDF (Máx. 10MB)
+              Suporta apenas arquivos PDF (Máx. 20MB)
             </p>
           </div>
         ) : (

@@ -7,7 +7,7 @@ import React, { useState } from 'react';
 import { CaseForm } from './components/CaseForm';
 import { DecisionDisplay } from './components/DecisionDisplay';
 import { CaseData } from './types';
-import { generateAnalysis } from './services/ai';
+import { generateAnalysis, PartialDecisionError } from './services/ai';
 import { Scale, Info } from 'lucide-react';
 
 export default function App() {
@@ -21,9 +21,12 @@ export default function App() {
     setDecision('');
 
     try {
-      const result = await generateAnalysis(data);
+      const result = await generateAnalysis(data, setDecision);
       setDecision(result);
     } catch (err: any) {
+      if (err instanceof PartialDecisionError) {
+        setDecision(err.partialText);
+      }
       setError(err?.message || 'Ocorreu um erro ao gerar a análise. Por favor, tente novamente.');
       console.error(err);
     } finally {

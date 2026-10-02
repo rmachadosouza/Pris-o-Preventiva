@@ -1,6 +1,6 @@
 import express from "express";
 import path from "path";
-import { GoogleGenAI, HarmCategory, HarmBlockThreshold } from "@google/genai";
+import { GoogleGenAI, HarmCategory, HarmBlockThreshold, FileState, createPartFromUri } from "@google/genai";
 import { createServer as createViteServer } from "vite";
 import dotenv from "dotenv";
 
@@ -10,8 +10,8 @@ const app = express();
 const PORT = 3000;
 
 // Body parser with size limits for large PDF files (base64)
-app.use(express.json({ limit: "50mb" }));
-app.use(express.urlencoded({ limit: "50mb", extended: true }));
+app.use(express.json({ limit: "30mb" }));
+app.use(express.urlencoded({ limit: "30mb", extended: true }));
 
 const SYSTEM_PROMPT = `
 ANÁLISE PREVENTIVA (ATUALIZADO LEI 15.272/2025)
@@ -117,171 +117,178 @@ function getAIClient(): GoogleGenAI {
 }
 
 // API endpoint for analyzing case documents
+//
+// O PDF é enviado à Gemini Files API (em vez de ir inline no corpo da requisição),
+// o que evita o limite de ~20MB de requisição inline e falhas silenciosas com autos
+// grandes/escaneados. A resposta é transmitida em streaming para o navegador, o que
+// evita timeouts de proxy/servidor em decisões longas.
+
+const MAX_PDF_BYTES = 20 * 1024 * 1024;
+const MODELS_TO_TRY = ["gemini-3.8-flash", "gemini-flash-latest", "gemini-3.1-flash-lite"];
+const STREAM_ERROR_MARKER = "\n\n[[ERRO_STREAM]]";
+
+function friendlyError(err: any): { status: number; message: string } {
+  let msg = err?.message || err?.error?.message || String(err || "");
+  if (typeof msg === "string" && msg.trim().startsWith("{")) {
+    try { msg = JSON.parse(msg).error?.message || msg; } catch { /* ignore */ }
+  }
+  const full = `${msg} ${err?.status || ""} ${JSON.stringify(err?.error || {})}`.toLowerCase();
+
+  if (full.includes("429") || full.includes("resource_exhausted") || full.includes("quota")) {
+    return { status: 429, message: "Limite de cota atingido na API Gemini. Aguarde cerca de 1 minuto e tente novamente." };
+  }
+  if (full.includes("503") || full.includes("unavailable") || full.includes("overloaded")) {
+    return { status: 503, message: "O serviço de IA está com alta demanda. Tente novamente em instantes." };
+  }
+  if (full.includes("api_key_invalid") || full.includes("api key not valid") || full.includes("api_key_not_found")) {
+    return { status: 400, message: "Chave da API Gemini inválida ou não configurada." };
+  }
+  if (full.includes("password") || full.includes("encrypt") || full.includes("document has no pages") || full.includes("unable to process input")) {
+    return { status: 422, message: "O modelo não conseguiu ler o PDF. Verifique se o arquivo não está protegido por senha ou corrompido (tente 'Imprimir como PDF' e reenviar)." };
+  }
+  return { status: 500, message: msg || "Não foi possível concluir a análise jurídica. Tente novamente." };
+}
+
+async function uploadPdf(ai: GoogleGenAI, pdf: Buffer, displayName: string) {
+  const blob = new Blob([pdf], { type: "application/pdf" });
+  let file = await ai.files.upload({ file: blob, config: { mimeType: "application/pdf", displayName } });
+
+  // PDFs grandes ficam em PROCESSING por alguns segundos antes de poderem ser usados.
+  const deadline = Date.now() + 120_000;
+  while (file.state === FileState.PROCESSING && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 2000));
+    file = await ai.files.get({ name: file.name! });
+  }
+  if (file.state === FileState.FAILED) {
+    throw new Error("O Google não conseguiu processar o PDF enviado (arquivo corrompido ou protegido por senha).");
+  }
+  if (file.state !== FileState.ACTIVE) {
+    throw new Error("Tempo esgotado aguardando o processamento do PDF. Tente novamente.");
+  }
+  return file;
+}
+
 app.post("/api/analyze", async (req, res) => {
+  const { fileData, fileName, additionalInfo } = req.body || {};
+
+  if (!fileData || typeof fileData !== "string") {
+    return res.status(400).json({ error: "O arquivo PDF dos autos é obrigatório para a análise." });
+  }
+
+  const base64 = fileData.includes(",") ? fileData.split(",")[1] : fileData;
+  const pdf = Buffer.from(base64, "base64");
+
+  if (pdf.length === 0 || pdf.subarray(0, 1024).indexOf("%PDF") === -1) {
+    return res.status(400).json({ error: "O arquivo enviado não é um PDF válido." });
+  }
+  if (pdf.length > MAX_PDF_BYTES) {
+    return res.status(413).json({ error: "O PDF deve ter no máximo 20MB." });
+  }
+
+  let ai: GoogleGenAI;
   try {
-    const { fileData, mimeType, additionalInfo } = req.body;
+    ai = getAIClient();
+  } catch (err: any) {
+    return res.status(500).json({ error: err.message });
+  }
 
-    if (!fileData) {
-      return res.status(400).json({ error: "O arquivo PDF dos autos é obrigatório para a análise." });
-    }
+  let uploaded: Awaited<ReturnType<typeof uploadPdf>> | null = null;
+  try {
+    uploaded = await uploadPdf(ai, pdf, typeof fileName === "string" ? fileName : "autos.pdf");
+  } catch (err: any) {
+    console.error("Falha no upload do PDF:", err);
+    const { status, message } = friendlyError(err);
+    return res.status(status).json({ error: message });
+  }
 
-    const sanitizedBase64 = typeof fileData === "string" && fileData.includes(",")
-      ? fileData.split(",")[1]
-      : fileData;
-    const sanitizedMime = (typeof mimeType === "string" && mimeType.includes("/"))
-      ? mimeType
-      : "application/pdf";
+  const userPrompt = `
+Analise o arquivo PDF anexo, que contém os autos do processo/flagrante.
+Extraia todas as informações necessárias (número do processo, partes, fatos, pedidos, etc.) diretamente do documento.
+Gere uma decisão judicial completa seguindo rigorosamente as instruções do sistema.
+${additionalInfo ? `\nINFORMAÇÕES ADICIONAIS FORNECIDAS PELO USUÁRIO:\n${additionalInfo}` : ""}`;
 
-    const ai = getAIClient();
+  let streamStarted = false;
+  let lastError: any = null;
 
-    const userPrompt = `
-      Analise o arquivo PDF anexo, que contém os autos do processo/flagrante.
-      Extraia todas as informações necessárias (número do processo, partes, fatos, pedidos, etc.) diretamente do documento.
-      Gere uma decisão judicial completa seguindo rigorosamente o SYSTEM PROMPT fornecido.
-      
-      ${additionalInfo ? `INFORMAÇÕES ADICIONAIS FORNECIDAS PELO USUÁRIO:\n${additionalInfo}` : ''}
-    `;
-
-    const modelsToTry = [
-      "gemini-3.8-flash",
-      "gemini-flash-latest",
-      "gemini-3.1-flash-lite"
-    ];
-
-    let lastError: any = null;
-    let generatedText: string | null = null;
-
-    for (const model of modelsToTry) {
+  try {
+    for (const model of MODELS_TO_TRY) {
       try {
         console.log(`Iniciando análise jurídica com o modelo: ${model}`);
-        const response = await ai.models.generateContent({
-          model: model,
+        const stream = await ai.models.generateContentStream({
+          model,
           contents: [
             {
               role: "user",
-              parts: [
-                { text: userPrompt },
-                {
-                  inlineData: {
-                    mimeType: sanitizedMime,
-                    data: sanitizedBase64
-                  }
-                }
-              ]
-            }
+              parts: [createPartFromUri(uploaded.uri!, "application/pdf"), { text: userPrompt }],
+            },
           ],
           config: {
             systemInstruction: SYSTEM_PROMPT,
             temperature: 0.4,
-            maxOutputTokens: 8192,
+            // Modelos Gemini 3 "pensam" antes de responder e o raciocínio consome este
+            // mesmo limite. Com 8192 a decisão saía vazia ou cortada (MAX_TOKENS).
+            maxOutputTokens: 65536,
             safetySettings: [
-              {
-                category: HarmCategory.HARM_CATEGORY_HARASSMENT,
-                threshold: HarmBlockThreshold.BLOCK_NONE,
-              },
-              {
-                category: HarmCategory.HARM_CATEGORY_HATE_SPEECH,
-                threshold: HarmBlockThreshold.BLOCK_NONE,
-              },
-              {
-                category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT,
-                threshold: HarmBlockThreshold.BLOCK_NONE,
-              },
-              {
-                category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT,
-                threshold: HarmBlockThreshold.BLOCK_NONE,
-              },
-              {
-                category: HarmCategory.HARM_CATEGORY_CIVIC_INTEGRITY,
-                threshold: HarmBlockThreshold.BLOCK_NONE,
-              },
+              { category: HarmCategory.HARM_CATEGORY_HARASSMENT, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_HATE_SPEECH, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT, threshold: HarmBlockThreshold.BLOCK_NONE },
+              { category: HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT, threshold: HarmBlockThreshold.BLOCK_NONE },
             ],
-          }
+          },
         });
 
-        let textOutput = "";
-        try {
-          if (typeof response.text === "string" && response.text.trim()) {
-            textOutput = response.text;
-          }
-        } catch (propErr: any) {
-          console.warn("Leitura direta de response.text falhou:", propErr?.message || propErr);
-        }
-
-        if (!textOutput && response.candidates?.[0]?.content?.parts) {
-          textOutput = response.candidates[0].content.parts
-            .filter((p: any) => typeof p.text === "string")
+        let finishReason: string | undefined;
+        for await (const chunk of stream) {
+          finishReason = chunk.candidates?.[0]?.finishReason || finishReason;
+          const text = chunk.candidates?.[0]?.content?.parts
+            ?.filter((p: any) => typeof p.text === "string" && !p.thought)
             .map((p: any) => p.text)
-            .join("\n");
+            .join("");
+          if (!text) continue;
+          if (!streamStarted) {
+            streamStarted = true;
+            res.status(200);
+            res.setHeader("Content-Type", "text/plain; charset=utf-8");
+            res.setHeader("Cache-Control", "no-cache, no-transform");
+            res.setHeader("X-Accel-Buffering", "no");
+            res.flushHeaders();
+          }
+          res.write(text);
         }
 
-        if (textOutput && textOutput.trim()) {
-          generatedText = textOutput;
-          console.log(`Análise concluída com sucesso usando o modelo: ${model}`);
-          break;
+        if (streamStarted) {
+          if (finishReason === "MAX_TOKENS") {
+            res.write(`${STREAM_ERROR_MARKER}A decisão foi interrompida por atingir o limite de tamanho de resposta do modelo.`);
+          } else if (finishReason === "SAFETY" || finishReason === "PROHIBITED_CONTENT") {
+            res.write(`${STREAM_ERROR_MARKER}A geração foi interrompida pelos filtros de segurança do modelo.`);
+          }
+          console.log(`Análise concluída com o modelo ${model} (finishReason: ${finishReason})`);
+          return res.end();
         }
 
-        const candidate = response.candidates?.[0];
-        if (candidate?.finishReason === "SAFETY") {
-          lastError = new Error("O processamento deste documento foi restrito pelos filtros de segurança do modelo.");
-        } else if (candidate?.finishReason) {
-          lastError = new Error(`Geração finalizada sem texto produzido (Motivo: ${candidate.finishReason})`);
-        }
+        lastError = new Error(
+          finishReason === "SAFETY" || finishReason === "PROHIBITED_CONTENT"
+            ? "O processamento deste documento foi bloqueado pelos filtros de segurança do modelo."
+            : `O modelo não produziu texto (motivo: ${finishReason || "desconhecido"}).`
+        );
       } catch (err: any) {
         lastError = err;
-        console.warn(`Tentativa com modelo ${model} falhou:`, err?.message || err?.error?.message || err);
-      }
-    }
-
-    if (!generatedText) {
-      let parsedMessage = "";
-      if (typeof lastError?.message === "string" && lastError.message.trim().startsWith("{")) {
-        try {
-          const parsed = JSON.parse(lastError.message);
-          parsedMessage = parsed.error?.message || "";
-        } catch {
-          // ignore
+        console.warn(`Modelo ${model} falhou:`, err?.message || err);
+        if (streamStarted) {
+          // Já enviamos parte da decisão; não dá para trocar de modelo no meio.
+          res.write(`${STREAM_ERROR_MARKER}${friendlyError(err).message}`);
+          return res.end();
         }
       }
-
-      const errMsg = parsedMessage || lastError?.message || lastError?.error?.message || "";
-      const errStatus = String(lastError?.status || lastError?.error?.code || lastError?.error?.status || "");
-      const errFull = `${errMsg} ${errStatus} ${JSON.stringify(lastError?.error || {})}`.toLowerCase();
-
-      console.error("Falha em todos os modelos. Último erro:", errMsg, "Status:", errStatus);
-
-      if (errFull.includes("429") || errFull.includes("resource_exhausted") || errFull.includes("quota") || errFull.includes("rate-limit")) {
-        return res.status(429).json({
-          error: "Limite de cota temporariamente atingido na API Gemini. Por favor, aguarde cerca de 30 segundos e tente novamente."
-        });
-      }
-      if (errFull.includes("503") || errFull.includes("unavailable") || errFull.includes("high demand") || errFull.includes("overloaded")) {
-        return res.status(503).json({
-          error: "O serviço de inteligência artificial está enfrentando alta demanda temporária nos servidores. Por favor, tente novamente em instantes."
-        });
-      }
-      if (errFull.includes("api_key_invalid") || errFull.includes("api key not valid") || errFull.includes("api_key_not_found")) {
-        return res.status(400).json({
-          error: "Chave da API Gemini inválida ou não configurada."
-        });
-      }
-      return res.status(500).json({
-        error: errMsg || "Não foi possível concluir a análise jurídica no momento. Por favor, tente novamente."
-      });
     }
 
-    res.json({ text: generatedText });
-  } catch (error: any) {
-    console.error("Erro na API de Análise Judicial:", error);
-    const errStr = error?.message || JSON.stringify(error || "");
-    if (errStr.includes("429") || errStr.includes("quota") || errStr.includes("RESOURCE_EXHAUSTED")) {
-      return res.status(429).json({
-        error: "Limite temporário de requisições atingido. Aguarde cerca de 1 minuto e tente novamente."
-      });
+    const { status, message } = friendlyError(lastError);
+    console.error("Falha em todos os modelos:", lastError);
+    res.status(status).json({ error: message });
+  } finally {
+    if (uploaded?.name) {
+      ai.files.delete({ name: uploaded.name }).catch(() => { /* expira sozinho em 48h */ });
     }
-    res.status(500).json({
-      error: "Erro no processamento do documento. Por favor, tente novamente."
-    });
   }
 });
 
@@ -289,7 +296,7 @@ app.post("/api/analyze", async (req, res) => {
 app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
   console.error("Erro interno do Express:", err);
   if (err?.type === "entity.too.large") {
-    return res.status(413).json({ error: "O arquivo PDF enviado é muito grande. O limite máximo é de 25MB." });
+    return res.status(413).json({ error: "O arquivo PDF enviado é muito grande. O limite máximo é de 20MB." });
   }
   res.status(err.status || 500).json({ error: err.message || "Erro interno do servidor ao processar requisição." });
 });
@@ -297,7 +304,8 @@ app.use((err: any, req: express.Request, res: express.Response, next: express.Ne
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      // HMR desativado: o WebSocket do Vite não é acessível no AI Studio/proxy.
+      server: { middlewareMode: true, hmr: false },
       appType: "spa",
     });
     app.use(vite.middlewares);
@@ -315,7 +323,9 @@ async function startServer() {
 
   server.keepAliveTimeout = 120000;
   server.headersTimeout = 125000;
-  server.timeout = 180000;
+  // Upload + processamento + geração de decisões longas pode passar de 3 minutos.
+  server.requestTimeout = 0;
+  server.timeout = 600000;
 }
 
 startServer();
